@@ -1,4 +1,5 @@
 import os
+import pyflac
 import threading
 import pyaudio
 import wave
@@ -26,6 +27,8 @@ parser.add_argument('-m', '--sensitivity', type=float, default=0.0,
 parser.add_argument('-l', '--save', action='store_true', help="Save recordings locally.")
 parser.add_argument('-v', '--verbose', action='store_true',
                     help="Enable verbose output for debugging.")
+parser.add_argument('-f', '--flac', action='store_true',
+                    help="Convert the recording to FLAC format before sending.")
 
 # Parse the arguments
 args = parser.parse_args()
@@ -44,6 +47,7 @@ FORMAT = pyaudio.paInt16
 CHANNELS = 1
 RATE = 16000
 CHUNK = 1024
+FLAC_OUTPUT_FILENAME =  'recording{}.flac'
 WAVE_OUTPUT_FILENAME = 'recording{}.wav'
 
 audio = pyaudio.PyAudio()
@@ -59,17 +63,48 @@ def is_silent(data_chunk):
     return volume < args.sensitivity
 
 
-def get_wav_filename():
-    return WAVE_OUTPUT_FILENAME.format(int(time.time()) if args.save else '')
+def get_output_filename():
+    if args.flac:
+        return FLAC_OUTPUT_FILENAME.format(int(time.time()) if args.save else '')
+    else:
+        # wav
+        return WAVE_OUTPUT_FILENAME.format(int(time.time()) if args.save else '')
 
 
 def get_base_url():
     return args.base_url if not args.base_url.endswith('/') else args.base_url[:-1]
 
+def get_content_type():
+    if args.flac:
+        return 'audio/flac'
+    else:
+        return 'audio/wav'
+
+
+def encoder_callback(buffer, num_bytes, num_samples, current_frame):
+    with open(get_output_filename(), 'w') as f:
+        files = {'file': (get_output_filename(), f, get_content_type())}
+        response = requests.post(f'{get_base_url()}/functions/v1/process-audio', files=files, headers={
+            'Authorization': f'Bearer {args.token}',
+            'apikey': args.token,
+        }, timeout=540)
+    logger.info(response.text)
+
+stream_encoder = pyflac.StreamEncoder(
+    write_callback=encoder_callback,
+    sample_rate=RATE,
+)
+
+
+def encode_to_flac(audio_data, flac_file, channels=1):
+    data = np.frombuffer(audio_data, dtype=np.int16)
+    data.reshape((len(data) // channels, channels))
+    stream_encoder.process(data)
+    stream_encoder.finish()
 
 def store_sound(frames):
     logger.debug('Store and sending wav.')
-    filename = get_wav_filename()
+    filename = get_output_filename()
     wf = wave.open(filename, 'wb')
     wf.setnchannels(CHANNELS)
     wf.setsampwidth(audio.get_sample_size(FORMAT))
@@ -77,13 +112,16 @@ def store_sound(frames):
     wf.writeframes(b''.join(frames))
     wf.close()
 
-    with open(filename, 'rb') as f:
-        files = {'file': (filename, f, 'audio/wav')}
-        response = requests.post(f'{get_base_url()}/functions/v1/process-audio', files=files, headers={
-            'Authorization': f'Bearer {args.token}',
-            'apikey': args.token,
-        }, timeout=540)
-    logger.info(response.text)
+    if args.flac:
+        encode_to_flac(b''.join(frames), filename)
+    else:
+        with open(filename, 'rb') as f:
+            files = {'file': (filename, f, get_content_type())}
+            response = requests.post(f'{get_base_url()}/functions/v1/process-audio', files=files, headers={
+                'Authorization': f'Bearer {args.token}',
+                'apikey': args.token,
+            }, timeout=540)
+        logger.info(response.text)
 
 
 def main():
@@ -104,7 +142,7 @@ Starting ADeus sound recording,
         stream.close()
         audio.terminate()
         if not args.save:
-            os.remove(get_wav_filename())
+            os.remove(get_output_filename())
         exit(0)
 
     signal.signal(signal.SIGINT, exit_script)
